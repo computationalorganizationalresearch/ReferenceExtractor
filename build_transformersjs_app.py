@@ -3,7 +3,7 @@
 Build a browser app that loads PDF text and extracts APA references.
 
 The app uses:
-- transformers.js for chunking/text normalization support in-browser.
+- Overlapping character chunks + regex matching in-browser.
 - The self-play-optimized regex produced by train_reference_extractor.py.
 """
 from __future__ import annotations
@@ -39,30 +39,41 @@ HTML = """<!doctype html>
 """
 
 
-JS_TEMPLATE = """import { pipeline } from 'https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2';
+JS_TEMPLATE = """const regexPattern = %REGEX_JSON%;
+const CHUNK_SIZE = 4000;
+const CHUNK_OVERLAP = 600;
 
-const regexPattern = %REGEX_JSON%;
-const rx = new RegExp(regexPattern, 'gs');
+function* overlappingChunks(text, size, overlap) {
+  if (size <= overlap) {
+    throw new Error('Chunk size must be larger than overlap.');
+  }
 
-// Use transformers.js as a semantic text preprocessor (normalization/chunk boundaries).
-const featureExtractor = await pipeline('feature-extraction', 'Xenova/all-MiniLM-L6-v2');
+  const step = size - overlap;
+  for (let start = 0; start < text.length; start += step) {
+    yield text.slice(start, start + size);
+    if (start + size >= text.length) break;
+  }
+}
+
+function extractDedupedReferences(text) {
+  const refs = [];
+  for (const chunk of overlappingChunks(text, CHUNK_SIZE, CHUNK_OVERLAP)) {
+    const chunkRegex = new RegExp(regexPattern, 'gs');
+    for (const m of chunk.matchAll(chunkRegex)) refs.push(m[0].trim());
+  }
+
+  return [...new Set(refs)];
+}
 
 function normalizeText(s) {
   return s.replace(/\r/g, '\\n').replace(/\u00A0/g, ' ');
 }
 
-document.getElementById('extract').addEventListener('click', async () => {
+document.getElementById('extract').addEventListener('click', () => {
   const input = document.getElementById('input').value;
   const text = normalizeText(input);
 
-  // Trigger embedding pass so chunks with very low semantic signal can be ignored if needed.
-  // In this baseline, we compute once and keep all text; future iterations can score chunk salience.
-  await featureExtractor(text.slice(0, 1500));
-
-  const refs = [];
-  for (const m of text.matchAll(rx)) refs.push(m[0].trim());
-
-  const deduped = [...new Set(refs)];
+  const deduped = extractDedupedReferences(text);
   document.getElementById('result').textContent = deduped.length
     ? deduped.map((r, i) => `${i + 1}. ${r}`).join('\\n\\n')
     : 'No APA-like references found.';
