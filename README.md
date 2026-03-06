@@ -5,7 +5,7 @@ Lightweight APA 7 reference extraction pipeline with:
 1. **Adversarial self-play regex optimization**.
 2. **Crossref-seeded reference generation** for more realistic citation formatting.
 3. **Tiny Transformer-like span tagger** trained on synthetic + adversarially perturbed chunks.
-4. **Browser deployment scaffold** that uses **transformers.js** + learned regex.
+4. **Browser deployment scaffold** that uses overlapping character chunks + learned regex.
 
 ## Files
 
