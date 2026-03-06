@@ -45,6 +45,25 @@ NOISE_LINES = [
     "Participant demographics appear in Table 2.",
     "The preprint has not been peer reviewed.",
     "Funding details are listed in the acknowledgments.",
+    "See also references in Supplementary Material B.",
+    "This sentence includes commas, years like 2021, and numbers 10-20.",
+    "Downloaded from the publisher's website on 12 Jan 2024.",
+    "Author note: correspondence should be directed to the lab.",
+]
+
+REFERENCE_HEADERS = [
+    "References",
+    "Bibliography",
+    "Selected readings",
+    "Works cited",
+    "Literature cited",
+]
+
+HARD_NEGATIVE_LINES = [
+    "Smith, J. (2020) Journal draft page 10 20.",
+    "doi 10.1234 this is not a full citation string",
+    "Kim, A., & Li, B. [2018]. Preprint only, no journal metadata",
+    "Table 3. Correlations between anxiety, mood, and sleep.",
 ]
 
 
@@ -118,7 +137,31 @@ def make_reference() -> str:
         f"{maybe([': A comparison', ': Evidence from a field study', ': A longitudinal analysis', ''])}. "
         f"{maybe(JOURNALS)}, {random.randint(1, 120)}{issue}, {pages}.{doi_part}"
     )
+    if random.random() < 0.22:
+        ref = ref.replace(".", ";", 1)
+    if random.random() < 0.2:
+        ref = ref.replace(",", ",", 1) + maybe(["", " Retrieved from https://example.org/article"])
     return normalize_reference_noise(ref)
+
+
+def make_reference_block(reference_pool: list[str] | None = None) -> list[tuple[str, bool]]:
+    lines: list[tuple[str, bool]] = []
+    block_len = random.randint(3, 10)
+    for _ in range(block_len):
+        roll = random.random()
+        if roll < 0.62:
+            ref = maybe(reference_pool) if (reference_pool and random.random() < 0.68) else make_reference()
+            if random.random() < 0.35 and len(ref) > 90:
+                wrap_at = random.randint(65, min(120, len(ref) - 5))
+                lines.append((ref[:wrap_at], True))
+                lines.append(("    " + ref[wrap_at:], True))
+            else:
+                lines.append((ref, True))
+        elif roll < 0.82:
+            lines.append((maybe(NOISE_LINES), False))
+        else:
+            lines.append((maybe(HARD_NEGATIVE_LINES), False))
+    return lines
 
 
 def crossref_author_to_apa(authors: list[dict]) -> str:
@@ -197,20 +240,21 @@ def fetch_crossref_references(target_count: int, timeout_s: int = 20) -> list[st
 
 
 def make_chunk(reference_pool: list[str] | None = None) -> Sample:
-    text = maybe(["This section reviews related literature.", "References", "Bibliography", "Selected readings"]) + "\n"
+    text = maybe(["This section reviews related literature.", "Appendix references", "Further reading"]) + "\n"
+    text += maybe(REFERENCE_HEADERS) + "\n"
     spans: List[Tuple[int, int]] = []
     cursor = len(text)
-    for _ in range(random.randint(2, 8)):
-        choose_ref = random.random() < 0.72
-        line = maybe(reference_pool) if (choose_ref and reference_pool and random.random() < 0.65) else (make_reference() if choose_ref else maybe(NOISE_LINES))
-        if choose_ref:
+    for line, is_reference in make_reference_block(reference_pool):
+        if is_reference:
             spans.append((cursor, cursor + len(line)))
         if random.random() < 0.25:
             prefix = maybe(["- ", "• ", f"{random.randint(1,30)}. "])
             line = prefix + line
-            if choose_ref:
+            if is_reference:
                 s, e = spans[-1]
                 spans[-1] = (s + len(prefix), e + len(prefix))
+        if not is_reference and random.random() < 0.2:
+            line = line + maybe(["", " (n = 214)", " [archived]"])
         text += line + "\n"
         cursor += len(line) + 1
     return Sample(text=text, spans=spans)
@@ -225,6 +269,8 @@ def perturb_text_adversarial(text: str) -> str:
         lambda s: s.replace("\u2013", "-"),
         lambda s: s + "\n" + maybe(NOISE_LINES),
         lambda s: s.replace("(20", "( 20", 1),
+        lambda s: s.replace("\n", "\n\n", random.randint(1, 4)),
+        lambda s: s.replace("doi:", "DOI:", random.randint(0, 2)),
     ]
     out = text
     for _ in range(random.randint(1, 3)):
@@ -381,10 +427,9 @@ def evaluate_pattern(pattern: str, samples: List[Sample], use_adversarial: bool 
 
 
 def self_play_optimize_regex(samples: List[Sample], rounds: int, eval_size: int = 4, pool_size: int = 5):
-    subset = random.sample(samples, k=min(eval_size, len(samples)))
-    adv_subset = [Sample(text=perturb_text_adversarial(s.text), spans=s.spans) for s in subset]
-
     def fast_reward(pattern: str) -> float:
+        subset = random.sample(samples, k=min(eval_size, len(samples)))
+        adv_subset = [Sample(text=perturb_text_adversarial(s.text), spans=s.spans) for s in subset]
         clean = sum(span_f1(spans_from_regex(pattern, s.text), s.spans) for s in subset)
         adv = sum(span_f1(spans_from_regex(pattern, s.text), s.spans) for s in adv_subset)
         return (clean + adv) / max(1, (len(subset) + len(adv_subset)))
