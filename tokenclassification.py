@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import random
 import re
@@ -299,15 +300,21 @@ def main() -> None:
         greater_is_better=True,
     )
 
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=tokenized_splits["train"],
-        eval_dataset=tokenized_splits["test"],
-        tokenizer=tokenizer,
-        data_collator=DataCollatorForTokenClassification(tokenizer=tokenizer),
-        compute_metrics=token_level_metrics,
-    )
+    trainer_kwargs = {
+        "model": model,
+        "args": training_args,
+        "train_dataset": tokenized_splits["train"],
+        "eval_dataset": tokenized_splits["test"],
+        "data_collator": DataCollatorForTokenClassification(tokenizer=tokenizer),
+        "compute_metrics": token_level_metrics,
+    }
+    trainer_init_params = inspect.signature(Trainer.__init__).parameters
+    if "tokenizer" in trainer_init_params:
+        trainer_kwargs["tokenizer"] = tokenizer
+    elif "processing_class" in trainer_init_params:
+        trainer_kwargs["processing_class"] = tokenizer
+
+    trainer = Trainer(**trainer_kwargs)
 
     trainer.train()
     metrics = trainer.evaluate()
