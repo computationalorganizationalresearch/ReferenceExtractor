@@ -78,7 +78,7 @@ def train(citations_file="citations.txt", base_model="distilbert-base-uncased", 
     enc = split.map(lambda b: tokenize_and_align(b, tok), batched=True, remove_columns=split["train"].column_names)
     model = AutoModelForTokenClassification.from_pretrained(base_model, num_labels=len(LABELS), id2label=dict(enumerate(LABELS)), label2id=L2I).to("cuda")
     args = TrainingArguments(out_dir, eval_strategy="epoch", save_strategy="epoch", num_train_epochs=2, learning_rate=3e-5, per_device_train_batch_size=16, per_device_eval_batch_size=16, weight_decay=0.01, logging_steps=25, report_to=[], disable_tqdm=False)
-    Trainer(model=model, args=args, train_dataset=enc["train"], eval_dataset=enc["test"], tokenizer=tok, data_collator=DataCollatorForTokenClassification(tok)).train()
+    Trainer(model=model, args=args, train_dataset=enc["train"], eval_dataset=enc["test"], data_collator=DataCollatorForTokenClassification(tok)).train()
     model.save_pretrained(out_dir)
     tok.save_pretrained(out_dir)
     return out_dir
