@@ -153,40 +153,67 @@ def perturb_reference_chars(
     min_pct=0.03,
     max_pct=0.12,
     alphabet="abcdefghijklmnopqrstuvwxyz0123456789",
+    whitespace_chars=" \t\n\r\f\v\u00a0",
 ):
     """
-    Add or remove a small percentage of random characters from a reference string.
-    This produces noisy variants so the token classifier learns to recover whole
-    references even when OCR/transcription mistakes are present.
+    Add/remove a percentage of random characters (including structural whitespace)
+    from a reference string to simulate OCR and document-extraction corruption.
     """
     if not text:
         return text
 
     chars = list(text)
-    operation = random.choices(
-        ["none", "insert", "delete", "both"],
-        weights=[1 - (insert_prob + delete_prob) / 2, insert_prob, delete_prob, 0.15],
-        k=1,
-    )[0]
 
     def rand_count(length):
         return max(1, int(round(length * random.uniform(min_pct, max_pct))))
 
-    if operation in {"delete", "both"} and len(chars) > 4:
+    op_weights = {
+        "none": max(0.0, 1.0 - insert_prob - delete_prob),
+        "insert": max(0.0, insert_prob),
+        "delete": max(0.0, delete_prob),
+        "both": max(0.0, min(insert_prob, delete_prob) * 0.5),
+    }
+    operations = [k for k, v in op_weights.items() if v > 0]
+    weights = [op_weights[k] for k in operations]
+    operation = random.choices(operations, weights=weights, k=1)[0] if operations else "none"
+
+    if operation in {"delete", "both"} and len(chars) > 3:
         k = min(rand_count(len(chars)), len(chars) - 1)
         for idx in sorted(random.sample(range(len(chars)), k), reverse=True):
             del chars[idx]
+
+    noisy_pool = list(alphabet) + list(whitespace_chars) + [
+        "-",
+        "_",
+        "/",
+        "\\",
+        ".",
+        ",",
+        ":",
+        ";",
+        "(",
+        ")",
+        "[",
+        "]",
+    ]
 
     if operation in {"insert", "both"}:
         k = rand_count(max(1, len(chars)))
         for _ in range(k):
             idx = random.randint(0, len(chars))
-            chars.insert(idx, random.choice(alphabet))
+            chars.insert(idx, random.choice(noisy_pool))
+
+    # Simulate realistic extraction glitches where whitespace/newlines are mutated.
+    if random.random() < 0.30 and chars:
+        pos = random.randint(0, len(chars) - 1)
+        chars[pos] = random.choice(["\n", "\t", "\r\n", "\u00a0"])
+
+    if random.random() < 0.20 and chars:
+        pos = random.randint(0, len(chars))
+        chars.insert(pos, random.choice(["\n\n", "\t", "\r", " \n"]))
 
     noisy = "".join(chars)
-    noisy = re.sub(r"\s{2,}", " ", noisy).strip()
     return noisy or text
-
 
 def make_example(
     citations,
