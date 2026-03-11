@@ -20,12 +20,12 @@ def random_text_tokens(n, lm="sshleifer/tiny-gpt2"):
         try:
             t = AutoTokenizer.from_pretrained(lm)
             m = AutoModelForCausalLM.from_pretrained(lm)
-            _GEN = pipeline("text-generation", model=m, tokenizer=t)
+            _GEN = pipeline("text-generation", model=m, tokenizer=t, pad_token_id=t.eos_token_id)
         except Exception:
             _GEN = False
     if _GEN:
         p = random.choice(["In this study,", "Related work shows", "Our experiments indicate", "Prior results suggest"]) 
-        txt = _GEN(p, max_new_tokens=max(24, n + 12), do_sample=True, top_k=50, top_p=0.95, temperature=0.9)[0]["generated_text"]
+        txt = _GEN(p, max_new_tokens=max(24, n + 12), max_length=None, do_sample=True, top_k=50, top_p=0.95, temperature=0.9, pad_token_id=_GEN.tokenizer.eos_token_id)[0]["generated_text"]
         toks = re.findall(r"\w+|[^\w\s]", txt)
         if len(toks) >= n:
             return toks[:n]
@@ -72,7 +72,7 @@ def train(citations_file="citations.txt", base_model="distilbert-base-uncased", 
     split, tok = ds.train_test_split(test_size=0.1, seed=42), AutoTokenizer.from_pretrained(base_model)
     enc = split.map(lambda b: tokenize_and_align(b, tok), batched=True, remove_columns=split["train"].column_names)
     model = AutoModelForTokenClassification.from_pretrained(base_model, num_labels=len(LABELS), id2label=dict(enumerate(LABELS)), label2id=L2I)
-    args = TrainingArguments(out_dir, eval_strategy="epoch", save_strategy="epoch", num_train_epochs=2, learning_rate=3e-5, per_device_train_batch_size=16, per_device_eval_batch_size=16, weight_decay=0.01, logging_steps=25, report_to=[])
+    args = TrainingArguments(out_dir, eval_strategy="epoch", save_strategy="epoch", num_train_epochs=2, learning_rate=3e-5, per_device_train_batch_size=16, per_device_eval_batch_size=16, weight_decay=0.01, logging_steps=25, report_to=[], disable_tqdm=False)
     Trainer(model=model, args=args, train_dataset=enc["train"], eval_dataset=enc["test"], tokenizer=tok, data_collator=DataCollatorForTokenClassification(tok)).train()
     model.save_pretrained(out_dir)
     tok.save_pretrained(out_dir)
