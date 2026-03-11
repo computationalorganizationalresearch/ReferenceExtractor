@@ -1,4 +1,4 @@
-import random, re
+import random, re, torch
 from pathlib import Path
 from transformers import AutoModelForCausalLM, AutoModelForTokenClassification, AutoTokenizer, DataCollatorForTokenClassification, Trainer, TrainingArguments, pipeline
 
@@ -14,19 +14,19 @@ def load_citations(path="citations.txt"):
     return refs
 
 
-def random_text_tokens(n, lm="sshleifer/tiny-gpt2", use_lm=False):
+def random_text_tokens(n, lm="hf-internal-testing/tiny-random-gpt2", use_lm=False):
     global _GEN
     if use_lm and _GEN is None:
         try:
             t = AutoTokenizer.from_pretrained(lm)
-            m = AutoModelForCausalLM.from_pretrained(lm)
+            m = AutoModelForCausalLM.from_pretrained(lm).to("cuda")
             _GEN = (t, m)
         except Exception:
             _GEN = False
     if use_lm and _GEN:
         t, m = _GEN
         p = random.choice(["In this study,", "Related work shows", "Our experiments indicate", "Prior results suggest"])
-        x = t(p, return_tensors="pt")
+        x = t(p, return_tensors="pt").to("cuda")
         y = m.generate(**x, max_length=x["input_ids"].shape[1] + max(24, n + 12), do_sample=True, top_k=50, top_p=0.95, temperature=0.9, pad_token_id=t.eos_token_id)
         toks = re.findall(r"\w+|[^\w\s]", t.decode(y[0], skip_special_tokens=True))
         if len(toks) >= n:
@@ -70,11 +70,13 @@ def tokenize_and_align(batch, tokenizer):
 
 
 def train(citations_file="citations.txt", base_model="distilbert-base-uncased", out_dir="ref-model", use_lm=False, lm_every=0, n=2500):
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA GPU is required for this script.")
     citations, ds = load_citations(citations_file), None
     ds = build_dataset(citations, n=n, use_lm=use_lm, lm_every=lm_every)
     split, tok = ds.train_test_split(test_size=0.1, seed=42), AutoTokenizer.from_pretrained(base_model)
     enc = split.map(lambda b: tokenize_and_align(b, tok), batched=True, remove_columns=split["train"].column_names)
-    model = AutoModelForTokenClassification.from_pretrained(base_model, num_labels=len(LABELS), id2label=dict(enumerate(LABELS)), label2id=L2I)
+    model = AutoModelForTokenClassification.from_pretrained(base_model, num_labels=len(LABELS), id2label=dict(enumerate(LABELS)), label2id=L2I).to("cuda")
     args = TrainingArguments(out_dir, eval_strategy="epoch", save_strategy="epoch", num_train_epochs=2, learning_rate=3e-5, per_device_train_batch_size=16, per_device_eval_batch_size=16, weight_decay=0.01, logging_steps=25, report_to=[], disable_tqdm=False)
     Trainer(model=model, args=args, train_dataset=enc["train"], eval_dataset=enc["test"], tokenizer=tok, data_collator=DataCollatorForTokenClassification(tok)).train()
     model.save_pretrained(out_dir)
@@ -83,7 +85,7 @@ def train(citations_file="citations.txt", base_model="distilbert-base-uncased", 
 
 
 def demo(model_dir="ref-model"):
-    ner = pipeline("token-classification", model=model_dir, tokenizer=model_dir, aggregation_strategy="simple")
+    ner = pipeline("token-classification", model=model_dir, tokenizer=model_dir, aggregation_strategy="simple", device=0)
     txt = "We compare against prior work Smith et al. 2021 and Doe, 2019, pp. 4-7 while reporting new scores."
     print(txt)
     print([x for x in ner(txt) if x["entity_group"].endswith("REF")])
