@@ -146,6 +146,48 @@ def random_text_tokens(
         return smart_text_tokens(n)
 
 
+def perturb_reference_chars(
+    text,
+    insert_prob=0.35,
+    delete_prob=0.35,
+    min_pct=0.03,
+    max_pct=0.12,
+    alphabet="abcdefghijklmnopqrstuvwxyz0123456789",
+):
+    """
+    Add or remove a small percentage of random characters from a reference string.
+    This produces noisy variants so the token classifier learns to recover whole
+    references even when OCR/transcription mistakes are present.
+    """
+    if not text:
+        return text
+
+    chars = list(text)
+    operation = random.choices(
+        ["none", "insert", "delete", "both"],
+        weights=[1 - (insert_prob + delete_prob) / 2, insert_prob, delete_prob, 0.15],
+        k=1,
+    )[0]
+
+    def rand_count(length):
+        return max(1, int(round(length * random.uniform(min_pct, max_pct))))
+
+    if operation in {"delete", "both"} and len(chars) > 4:
+        k = min(rand_count(len(chars)), len(chars) - 1)
+        for idx in sorted(random.sample(range(len(chars)), k), reverse=True):
+            del chars[idx]
+
+    if operation in {"insert", "both"}:
+        k = rand_count(max(1, len(chars)))
+        for _ in range(k):
+            idx = random.randint(0, len(chars))
+            chars.insert(idx, random.choice(alphabet))
+
+    noisy = "".join(chars)
+    noisy = re.sub(r"\s{2,}", " ", noisy).strip()
+    return noisy or text
+
+
 def make_example(
     citations,
     min_words=40,
@@ -153,6 +195,9 @@ def make_example(
     max_refs=4,
     strategy="smart",
     archive_path="english_archive.txt",
+    ref_noise_prob=0.75,
+    ref_noise_min_pct=0.03,
+    ref_noise_max_pct=0.12,
 ):
     words = random_text_tokens(
         random.randint(min_words, max_words),
@@ -161,7 +206,15 @@ def make_example(
     labels = ["O"] * len(words)
 
     for _ in range(random.randint(1, max_refs)):
-        ref = TOKEN_RE.findall(random.choice(citations))
+        ref_text = random.choice(citations)
+        if random.random() < ref_noise_prob:
+            ref_text = perturb_reference_chars(
+                ref_text,
+                min_pct=ref_noise_min_pct,
+                max_pct=ref_noise_max_pct,
+            )
+
+        ref = TOKEN_RE.findall(ref_text)
         if not ref:
             continue
         i = random.randint(0, len(words))
@@ -180,6 +233,9 @@ def build_dataset(
     citations,
     n=2500,
     archive_path="english_archive.txt",
+    ref_noise_prob=0.75,
+    ref_noise_min_pct=0.03,
+    ref_noise_max_pct=0.12,
 ):
     from datasets import Dataset
 
@@ -187,6 +243,9 @@ def build_dataset(
         make_example(
             citations,
             archive_path=archive_path,
+            ref_noise_prob=ref_noise_prob,
+            ref_noise_min_pct=ref_noise_min_pct,
+            ref_noise_max_pct=ref_noise_max_pct,
         )
         for _ in range(n)
     ]
@@ -215,6 +274,9 @@ def train(
     lm="roneneldan/TinyStories-33M",
     n=2500,
     drop_link_prob=0.5,
+    ref_noise_prob=0.75,
+    ref_noise_min_pct=0.03,
+    ref_noise_max_pct=0.12,
 ):
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA GPU is required for this script.")
@@ -224,6 +286,9 @@ def train(
         citations,
         n=n,
         archive_path=archive_path,
+        ref_noise_prob=ref_noise_prob,
+        ref_noise_min_pct=ref_noise_min_pct,
+        ref_noise_max_pct=ref_noise_max_pct,
     )
 
     split = ds.train_test_split(test_size=0.1, seed=42)
