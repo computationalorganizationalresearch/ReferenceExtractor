@@ -271,8 +271,14 @@ def train(
     tok.save_pretrained(out_dir)
     return out_dir
 
-
-
+"""
+ner = pipeline(
+        "token-classification",
+        model="ref-model",
+        tokenizer="ref-model",
+        aggregation_strategy="simple",
+        device=0)
+"""
 
 if __name__ == "__main__":
     # One-time archive build (optional, but recommended for the fastest mode):
