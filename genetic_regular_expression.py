@@ -15,6 +15,7 @@ import random
 import re
 import string
 import sys
+import time
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 
@@ -414,6 +415,8 @@ def evolve_reference_regex(
     negative_multiplier: int = 8,
     seed: int = 7,
     use_gpu: bool = False,
+    show_progress: bool = False,
+    progress_every: int = 10,
 ) -> Tuple[str, dict]:
     positives = _normalize(lines)
     if not positives:
@@ -435,9 +438,13 @@ def evolve_reference_regex(
 
     best = Candidate(seed_genomes[0], _compile(seed_genomes[0]), -1e9, 0, len(neg) + len(hard) + len(boundary))
 
+    start_t = time.perf_counter()
+    evaluations = 0
+
     for gen in range(generations):
         for i, pop in enumerate(island_pops):
             batch = evaluator.evaluate_population(pop)
+            evaluations += len(pop)
             scored = [Candidate(pop[j], batch[j][3], batch[j][0], batch[j][1], batch[j][2]) for j in range(len(pop))]
             scored.sort(key=lambda c: c.fitness, reverse=True)
             if scored and scored[0].fitness > best.fitness:
@@ -456,6 +463,21 @@ def evolve_reference_regex(
                 next_pop.append(child)
             island_pops[i] = next_pop
 
+        if show_progress and (gen == 0 or (gen + 1) % max(1, progress_every) == 0 or (gen + 1) == generations):
+            elapsed = max(1e-9, time.perf_counter() - start_t)
+            evals_per_s = evaluations / elapsed
+            print(
+                f"[progress] gen={gen + 1}/{generations} "
+                f"best_fitness={best.fitness:.6f} "
+                f"best_tp={best.tp} "
+                f"best_fp={best.fp} "
+                f"evals={evaluations} "
+                f"evals_per_sec={evals_per_s:.2f} "
+                f"cache_regex={len(evaluator.count_cache)} "
+                f"gpu={evaluator.gpu_enabled}",
+                flush=True,
+            )
+
         # periodic migration between islands
         if islands > 1 and gen % 8 == 0:
             champions = []
@@ -465,6 +487,8 @@ def evolve_reference_regex(
                 champions.append(pop[cand][:])
             for i in range(len(island_pops)):
                 island_pops[(i + 1) % len(island_pops)][-1] = champions[i]
+
+    total_elapsed = max(1e-9, time.perf_counter() - start_t)
 
     diagnostics = {
         "fitness": round(best.fitness, 6),
@@ -481,6 +505,9 @@ def evolve_reference_regex(
         "hard_negative_count": len(hard),
         "boundary_negative_count": len(boundary),
         "seed_signature_examples": [_shape_signature(x) for x in positives[:3]],
+        "training_seconds": round(total_elapsed, 6),
+        "total_evaluations": evaluations,
+        "evaluations_per_second": round(evaluations / total_elapsed, 3),
     }
     if use_gpu and not evaluator.gpu_enabled:
         diagnostics["gpu_fallback_reason"] = evaluator._gpu_error or "unknown"
@@ -538,6 +565,8 @@ def _cli(argv: Sequence[str]) -> int:
     parser.add_argument("--negative-multiplier", type=int, default=8)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--gpu", action="store_true", help="Use GPU path if cudf is available.")
+    parser.add_argument("--show-progress", action="store_true", help="Print performance progress during training.")
+    parser.add_argument("--progress-every", type=int, default=10, help="Print progress every N generations.")
     args = parser.parse_args(list(argv[1:]))
 
     lines = _reservoir_sample_file(args.input_file, max_lines=max(1, args.max_train_lines), seed=args.seed)
@@ -553,6 +582,8 @@ def _cli(argv: Sequence[str]) -> int:
         negative_multiplier=args.negative_multiplier,
         seed=args.seed,
         use_gpu=args.gpu,
+        show_progress=args.show_progress,
+        progress_every=args.progress_every,
     )
 
     py_regex = _to_python_regex(regex)
