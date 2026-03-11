@@ -9,6 +9,8 @@ Design goals:
 from __future__ import annotations
 
 from dataclasses import dataclass
+import argparse
+import json
 import random
 import re
 import string
@@ -485,22 +487,84 @@ def evolve_reference_regex(
     return best.regex, diagnostics
 
 
+def _reservoir_sample_file(path: str, max_lines: int, seed: int) -> List[str]:
+    """Read one-line-per-example file with bounded memory using reservoir sampling."""
+    rng = random.Random(seed)
+    sample: List[str] = []
+    seen = 0
+    with open(path, "r", encoding="utf-8") as fh:
+        for raw in fh:
+            line = raw.strip()
+            if not line:
+                continue
+            seen += 1
+            if len(sample) < max_lines:
+                sample.append(line)
+            else:
+                j = rng.randint(1, seen)
+                if j <= max_lines:
+                    sample[j - 1] = line
+    return sample
+
+
+def _to_python_regex(regex: str) -> str:
+    return f"r{regex!r}"
+
+
+def _to_javascript_regex(regex: str) -> str:
+    escaped = regex.replace('\\', '\\\\').replace('/', '\/')
+    return f"/{escaped}/"
+
+
+def _write_results(path: str, py_regex: str, js_regex: str, diagnostics: dict) -> None:
+    payload = {
+        "python": {"regex": py_regex},
+        "javascript": {"regex": js_regex},
+        "diagnostics": diagnostics,
+    }
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2, ensure_ascii=False)
+
+
+
 def _cli(argv: Sequence[str]) -> int:
-    if len(argv) < 2:
-        print("Usage: python genetic_regular_expression.py <lines.txt> [--gpu]")
+    parser = argparse.ArgumentParser(description="Evolve regex from positive-only line examples.")
+    parser.add_argument("input_file", help="Path to text file with one target example per line.")
+    parser.add_argument("--output", default="regex_results.json", help="Results JSON path (default: regex_results.json)")
+    parser.add_argument("--max-train-lines", type=int, default=200000, help="Reservoir-sampled training size for huge files.")
+    parser.add_argument("--generations", type=int, default=200)
+    parser.add_argument("--population-size", type=int, default=120)
+    parser.add_argument("--islands", type=int, default=3)
+    parser.add_argument("--negative-multiplier", type=int, default=8)
+    parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--gpu", action="store_true", help="Use GPU path if cudf is available.")
+    args = parser.parse_args(list(argv[1:]))
+
+    lines = _reservoir_sample_file(args.input_file, max_lines=max(1, args.max_train_lines), seed=args.seed)
+    if not lines:
+        print("No non-empty lines found in input file.")
         return 2
 
-    path = argv[1]
-    use_gpu = "--gpu" in argv[2:]
-    with open(path, "r", encoding="utf-8") as fh:
-        lines = [x.rstrip("\n") for x in fh]
+    regex, info = evolve_reference_regex(
+        lines,
+        generations=args.generations,
+        population_size=args.population_size,
+        islands=args.islands,
+        negative_multiplier=args.negative_multiplier,
+        seed=args.seed,
+        use_gpu=args.gpu,
+    )
 
-    regex, info = evolve_reference_regex(lines, use_gpu=use_gpu)
+    py_regex = _to_python_regex(regex)
+    js_regex = _to_javascript_regex(regex)
+    _write_results(args.output, py_regex, js_regex, info)
+
     print("Best regex:\n")
     print(regex)
-    print("\nDiagnostics:")
-    for k, v in info.items():
-        print(f"- {k}: {v}")
+    print("\nPython:", py_regex)
+    print("JavaScript:", js_regex)
+    print(f"\nSaved results to: {args.output}")
+
     return 0
 
 
