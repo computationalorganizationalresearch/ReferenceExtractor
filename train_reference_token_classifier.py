@@ -20,13 +20,15 @@ def random_text_tokens(n, lm="sshleifer/tiny-gpt2"):
         try:
             t = AutoTokenizer.from_pretrained(lm)
             m = AutoModelForCausalLM.from_pretrained(lm)
-            _GEN = pipeline("text-generation", model=m, tokenizer=t, pad_token_id=t.eos_token_id)
+            _GEN = (t, m)
         except Exception:
             _GEN = False
     if _GEN:
-        p = random.choice(["In this study,", "Related work shows", "Our experiments indicate", "Prior results suggest"]) 
-        txt = _GEN(p, max_new_tokens=max(24, n + 12), max_length=None, do_sample=True, top_k=50, top_p=0.95, temperature=0.9, pad_token_id=_GEN.tokenizer.eos_token_id)[0]["generated_text"]
-        toks = re.findall(r"\w+|[^\w\s]", txt)
+        t, m = _GEN
+        p = random.choice(["In this study,", "Related work shows", "Our experiments indicate", "Prior results suggest"])
+        x = t(p, return_tensors="pt")
+        y = m.generate(**x, max_length=x["input_ids"].shape[1] + max(24, n + 12), do_sample=True, top_k=50, top_p=0.95, temperature=0.9, pad_token_id=t.eos_token_id)
+        toks = re.findall(r"\w+|[^\w\s]", t.decode(y[0], skip_special_tokens=True))
         if len(toks) >= n:
             return toks[:n]
     vocab = "the study reports robust comparative empirical findings across methods datasets baselines results indicate performance variability under settings while analysis discusses evidence".split()
