@@ -4,9 +4,9 @@ All-in-one Colab-friendly script to fine-tune ModernBERT for span boundary detec
 Task:
 - Build synthetic training examples by inserting lines from `input.txt` into C4 paragraphs.
 - Some paragraphs receive no inserted line (`no_insert_pct`).
-- Inserted lines can be randomly corrupted by character additions/deletions
-  (`corruption_frequency`, `corruption_percentage`).
-- Fine-tune a QA-style model that predicts start/end token positions for the inserted span.
+- Inserted lines can be randomly corrupted by character additions/deletions.
+- Fine-tune a QA-style model that predicts start/end token positions.
+- Support multiple inserted spans per paragraph and return multiple predicted spans.
 
 Usage in Colab:
     !pip -q install datasets transformers accelerate sentencepiece
@@ -19,6 +19,7 @@ Usage in Colab:
         corruption_frequency=0.6,
         no_insert_pct=0.3,
         max_samples=2000,
+        max_insertions_per_paragraph=3,
     )
 """
 
@@ -79,13 +80,15 @@ def maybe_corrupt_text(
     return "".join(chars)
 
 
-def insert_line_into_paragraph(
+def insert_lines_into_paragraph(
     paragraph: str,
-    line: str,
+    lines: List[str],
     no_insert_pct: float,
     corruption_percentage: float,
     corruption_frequency: float,
+    max_insertions_per_paragraph: int,
 ) -> Tuple[str, List[Tuple[int, int]]]:
+    """Insert 0..N lines and return resulting text and all inserted char spans."""
     paragraph = " ".join(paragraph.split())
     if not paragraph:
         return "", []
@@ -93,17 +96,40 @@ def insert_line_into_paragraph(
     if random.random() < no_insert_pct:
         return paragraph, []
 
-    ins = maybe_corrupt_text(line, corruption_percentage, corruption_frequency)
-    pos = random.randrange(len(paragraph) + 1)
+    n_insertions = random.randint(1, max(1, max_insertions_per_paragraph))
+    chosen_lines = random.sample(lines, k=min(n_insertions, len(lines)))
+    inserts = [
+        maybe_corrupt_text(x, corruption_percentage=corruption_percentage, corruption_frequency=corruption_frequency)
+        for x in chosen_lines
+    ]
 
-    prefix = paragraph[:pos].rstrip()
-    suffix = paragraph[pos:].lstrip()
-    pieces = [p for p in [prefix, ins, suffix] if p]
-    joined = "\n".join(pieces)
+    positions = sorted(random.randint(0, len(paragraph)) for _ in range(len(inserts)))
 
-    start = joined.find(ins)
-    end = start + len(ins)
-    return joined, [(start, end)] if start >= 0 else []
+    spans: List[Tuple[int, int]] = []
+    out = ""
+    prev = 0
+
+    def append_piece(piece: str) -> Tuple[int, int]:
+        nonlocal out
+        if not piece:
+            return -1, -1
+        if out:
+            out += "\n"
+        start = len(out)
+        out += piece
+        end = len(out)
+        return start, end
+
+    for pos, ins in zip(positions, inserts):
+        chunk = paragraph[prev:pos]
+        append_piece(chunk)
+        s, e = append_piece(ins)
+        if s >= 0:
+            spans.append((s, e))
+        prev = pos
+
+    append_piece(paragraph[prev:])
+    return out, spans
 
 
 def build_synthetic_dataset(
@@ -112,6 +138,7 @@ def build_synthetic_dataset(
     no_insert_pct: float = 0.3,
     corruption_percentage: float = 0.1,
     corruption_frequency: float = 0.6,
+    max_insertions_per_paragraph: int = 3,
     c4_config: str = "en",
     seed: int = 42,
 ) -> Dataset:
@@ -120,30 +147,47 @@ def build_synthetic_dataset(
 
     c4 = load_dataset("allenai/c4", c4_config, split="train", streaming=True)
 
-    texts, spans, questions = [], [], []
+    contexts, spans, questions = [], [], []
     for row in c4:
         text = (row.get("text") or "").strip()
         if len(text) < 100:
             continue
-        chosen = random.choice(lines)
-        out_text, out_spans = insert_line_into_paragraph(
+
+        out_text, out_spans = insert_lines_into_paragraph(
             text,
-            chosen,
+            lines=lines,
             no_insert_pct=no_insert_pct,
             corruption_percentage=corruption_percentage,
             corruption_frequency=corruption_frequency,
+            max_insertions_per_paragraph=max_insertions_per_paragraph,
         )
         if out_text:
-            texts.append(out_text)
+            contexts.append(out_text)
             spans.append(out_spans)
             questions.append(DEFAULT_QUESTION)
-        if len(texts) >= max_samples:
+        if len(contexts) >= max_samples:
             break
 
-    if not texts:
+    if not contexts:
         raise RuntimeError("No samples generated from C4.")
 
-    return Dataset.from_dict({"question": questions, "context": texts, "spans": spans})
+    return Dataset.from_dict({"question": questions, "context": contexts, "spans": spans})
+
+
+def explode_multi_span_examples(dataset: Dataset) -> Dataset:
+    """Convert each multi-span row into 1 row/span (+ 1 no-answer row when empty)."""
+    questions, contexts, single_spans = [], [], []
+    for ex in dataset:
+        if not ex["spans"]:
+            questions.append(ex["question"])
+            contexts.append(ex["context"])
+            single_spans.append([])
+            continue
+        for sp in ex["spans"]:
+            questions.append(ex["question"])
+            contexts.append(ex["context"])
+            single_spans.append([sp])
+    return Dataset.from_dict({"question": questions, "context": contexts, "spans": single_spans})
 
 
 def tokenize_for_qa(dataset: Dataset, tokenizer, max_length: int = 512, doc_stride: int = 128) -> Dataset:
@@ -224,6 +268,7 @@ class TrainConfig:
     max_length: int = 512
     max_samples: int = 2000
     eval_ratio: float = 0.1
+    max_insertions_per_paragraph: int = 3
     seed: int = 42
 
 
@@ -234,6 +279,7 @@ def train_boundary_detector(
     corruption_frequency: float = 0.6,
     no_insert_pct: float = 0.3,
     max_samples: int = 2000,
+    max_insertions_per_paragraph: int = 3,
     model_name: str = "answerdotai/ModernBERT-base",
     output_dir: str = "modernbert-boundary-qa",
 ):
@@ -243,6 +289,7 @@ def train_boundary_detector(
         output_dir=output_dir,
         epochs=epochs,
         max_samples=max_samples,
+        max_insertions_per_paragraph=max_insertions_per_paragraph,
     )
     set_seed(cfg.seed)
 
@@ -252,13 +299,18 @@ def train_boundary_detector(
         no_insert_pct=no_insert_pct,
         corruption_percentage=corruption_percentage,
         corruption_frequency=corruption_frequency,
+        max_insertions_per_paragraph=cfg.max_insertions_per_paragraph,
         seed=cfg.seed,
     )
     split = ds.train_test_split(test_size=cfg.eval_ratio, seed=cfg.seed)
 
+    # One training row per target span, plus no-answer rows.
+    train_flat = explode_multi_span_examples(split["train"])
+    eval_flat = explode_multi_span_examples(split["test"])
+
     tokenizer = AutoTokenizer.from_pretrained(cfg.model_name, use_fast=True)
-    train_ds = tokenize_for_qa(split["train"], tokenizer, max_length=cfg.max_length)
-    eval_ds = tokenize_for_qa(split["test"], tokenizer, max_length=cfg.max_length)
+    train_ds = tokenize_for_qa(train_flat, tokenizer, max_length=cfg.max_length)
+    eval_ds = tokenize_for_qa(eval_flat, tokenizer, max_length=cfg.max_length)
 
     model = AutoModelForQuestionAnswering.from_pretrained(cfg.model_name)
 
@@ -298,9 +350,11 @@ def predict_inserted_segments(
     model,
     question: str = DEFAULT_QUESTION,
     max_length: int = 512,
+    max_predictions: int = 3,
     min_confidence: float = 0.0,
-) -> List[str]:
-    """Predict inserted segment via start/end token scores. Returns [] for no-answer."""
+    max_answer_tokens: int = 64,
+) -> List[dict]:
+    """Return multiple predicted spans as [{'start_token','end_token','text','score'}]."""
     model.eval()
     enc = tokenizer(
         question,
@@ -309,27 +363,51 @@ def predict_inserted_segments(
         max_length=max_length,
         return_tensors="pt",
     )
+
+    input_ids_cpu = enc["input_ids"][0].tolist()
     enc = {k: v.to(model.device) for k, v in enc.items()}
 
     with torch.no_grad():
         out = model(**enc)
-        start_logits = out.start_logits[0]
-        end_logits = out.end_logits[0]
+        start_logits = out.start_logits[0].detach().cpu()
+        end_logits = out.end_logits[0].detach().cpu()
 
-    input_ids = enc["input_ids"][0].detach().cpu().tolist()
-    cls_index = input_ids.index(tokenizer.cls_token_id)
-    best_start = int(torch.argmax(start_logits).item())
-    best_end = int(torch.argmax(end_logits).item())
-
+    cls_index = input_ids_cpu.index(tokenizer.cls_token_id)
     null_score = float(start_logits[cls_index] + end_logits[cls_index])
-    best_score = float(start_logits[best_start] + end_logits[best_end])
 
-    if best_end < best_start or (best_score - null_score) < min_confidence:
-        return []
+    top_starts = torch.topk(start_logits, k=min(max_predictions * 4, start_logits.numel())).indices.tolist()
+    top_ends = torch.topk(end_logits, k=min(max_predictions * 4, end_logits.numel())).indices.tolist()
 
-    answer_ids = input_ids[best_start : best_end + 1]
-    ans = tokenizer.decode(answer_ids, skip_special_tokens=True).strip()
-    return [ans] if ans else []
+    candidates = []
+    for s in top_starts:
+        for e in top_ends:
+            if e < s:
+                continue
+            if (e - s + 1) > max_answer_tokens:
+                continue
+            score = float(start_logits[s] + end_logits[e] - null_score)
+            if score < min_confidence:
+                continue
+            token_ids = input_ids_cpu[s : e + 1]
+            ans = tokenizer.decode(token_ids, skip_special_tokens=True).strip()
+            if not ans:
+                continue
+            candidates.append({"start_token": s, "end_token": e, "text": ans, "score": score})
+
+    candidates.sort(key=lambda x: x["score"], reverse=True)
+
+    deduped = []
+    seen = set()
+    for cand in candidates:
+        key = (cand["start_token"], cand["end_token"], cand["text"])
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(cand)
+        if len(deduped) >= max_predictions:
+            break
+
+    return deduped
 
 
 if __name__ == "__main__":
@@ -340,6 +418,7 @@ if __name__ == "__main__":
         corruption_frequency=0.5,
         no_insert_pct=0.3,
         max_samples=200,
+        max_insertions_per_paragraph=3,
     )
-    sample = "This is a paragraph where a citation-like string may appear somewhere in the middle."
-    print(predict_inserted_segments(sample, tok, mdl))
+    sample = "This is a paragraph where citation alpha may appear and later citation beta may also appear."
+    print(predict_inserted_segments(sample, tok, mdl, max_predictions=3))
