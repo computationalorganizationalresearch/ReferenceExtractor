@@ -1,12 +1,12 @@
 """
-All-in-one Colab-friendly script to finetune ModernBERT for boundary detection.
+All-in-one Colab-friendly script to fine-tune ModernBERT for span boundary detection.
 
 Task:
 - Build synthetic training examples by inserting lines from `input.txt` into C4 paragraphs.
 - Some paragraphs receive no inserted line (`no_insert_pct`).
 - Inserted lines can be randomly corrupted by character additions/deletions
   (`corruption_frequency`, `corruption_percentage`).
-- Finetune a token-classification model (BIO labels) to recover inserted text spans.
+- Fine-tune a QA-style model that predicts start/end token positions for the inserted span.
 
 Usage in Colab:
     !pip -q install datasets transformers accelerate sentencepiece
@@ -24,23 +24,21 @@ Usage in Colab:
 
 import random
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
 from datasets import Dataset, load_dataset
 from transformers import (
-    AutoModelForTokenClassification,
+    AutoModelForQuestionAnswering,
     AutoTokenizer,
-    DataCollatorForTokenClassification,
+    DefaultDataCollator,
     Trainer,
     TrainingArguments,
 )
 
 
-LABELS = ["O", "B-INS", "I-INS"]
-LABEL2ID = {x: i for i, x in enumerate(LABELS)}
-ID2LABEL = {i: x for x, i in LABEL2ID.items()}
+DEFAULT_QUESTION = "What exact inserted line appears in this paragraph?"
 
 
 def set_seed(seed: int = 42):
@@ -64,11 +62,6 @@ def maybe_corrupt_text(
     corruption_frequency: float,
     alphabet: str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ,.-;:'\"()[]{}!?/\\",
 ) -> str:
-    """Corrupt text via random char insertion/deletion.
-
-    corruption_frequency: probability a line is corrupted at all.
-    corruption_percentage: fraction of chars to edit when corruption happens.
-    """
     if random.random() >= corruption_frequency or not text:
         return text
 
@@ -76,12 +69,11 @@ def maybe_corrupt_text(
     n_ops = max(1, int(len(chars) * max(0.0, corruption_percentage)))
     for _ in range(n_ops):
         if not chars:
-            # force insertion if emptied out
             chars.insert(0, random.choice(alphabet))
             continue
-        if random.random() < 0.5:  # delete
+        if random.random() < 0.5:
             del chars[random.randrange(len(chars))]
-        else:  # insert
+        else:
             pos = random.randrange(len(chars) + 1)
             chars.insert(pos, random.choice(alphabet))
     return "".join(chars)
@@ -94,7 +86,6 @@ def insert_line_into_paragraph(
     corruption_percentage: float,
     corruption_frequency: float,
 ) -> Tuple[str, List[Tuple[int, int]]]:
-    """Returns paragraph text + list of inserted spans (char start, char end)."""
     paragraph = " ".join(paragraph.split())
     if not paragraph:
         return "", []
@@ -110,7 +101,6 @@ def insert_line_into_paragraph(
     pieces = [p for p in [prefix, ins, suffix] if p]
     joined = "\n".join(pieces)
 
-    # locate inserted span in joined text
     start = joined.find(ins)
     end = start + len(ins)
     return joined, [(start, end)] if start >= 0 else []
@@ -128,10 +118,9 @@ def build_synthetic_dataset(
     set_seed(seed)
     lines = load_lines(input_txt_path)
 
-    # Streaming keeps memory low in Colab.
     c4 = load_dataset("allenai/c4", c4_config, split="train", streaming=True)
 
-    texts, spans = [], []
+    texts, spans, questions = [], [], []
     for row in c4:
         text = (row.get("text") or "").strip()
         if len(text) < 100:
@@ -147,50 +136,77 @@ def build_synthetic_dataset(
         if out_text:
             texts.append(out_text)
             spans.append(out_spans)
+            questions.append(DEFAULT_QUESTION)
         if len(texts) >= max_samples:
             break
 
     if not texts:
         raise RuntimeError("No samples generated from C4.")
 
-    return Dataset.from_dict({"text": texts, "spans": spans})
+    return Dataset.from_dict({"question": questions, "context": texts, "spans": spans})
 
 
-def char_spans_to_token_labels(offsets, spans: List[List[int]]) -> List[int]:
-    labels = [LABEL2ID["O"]] * len(offsets)
-    for (s, e) in spans:
-        first = True
-        for i, (ts, te) in enumerate(offsets):
-            if ts == te:
-                continue
-            overlap = ts < e and te > s
-            if overlap:
-                labels[i] = LABEL2ID["B-INS"] if first else LABEL2ID["I-INS"]
-                first = False
-    return labels
-
-
-def tokenize_and_label(dataset: Dataset, tokenizer, max_length: int = 512) -> Dataset:
+def tokenize_for_qa(dataset: Dataset, tokenizer, max_length: int = 512, doc_stride: int = 128) -> Dataset:
     def _map(batch):
         tok = tokenizer(
-            batch["text"],
-            truncation=True,
+            batch["question"],
+            batch["context"],
+            truncation="only_second",
             max_length=max_length,
+            stride=doc_stride,
+            return_overflowing_tokens=True,
             return_offsets_mapping=True,
+            padding="max_length",
         )
-        all_labels = []
-        for offsets, spans in zip(tok["offset_mapping"], batch["spans"]):
-            labels = char_spans_to_token_labels(offsets, spans)
-            # mask special tokens
-            all_labels.append([
-                label if not (s == 0 and e == 0) else -100 for (s, e), label in zip(offsets, labels)
-            ])
-        tok["labels"] = all_labels
-        tok.pop("offset_mapping")
+
+        sample_map = tok.pop("overflow_to_sample_mapping")
+        offsets = tok.pop("offset_mapping")
+        start_positions = []
+        end_positions = []
+
+        for i, offset in enumerate(offsets):
+            sample_idx = sample_map[i]
+            spans = batch["spans"][sample_idx]
+            span = spans[0] if spans else None
+            seq_ids = tok.sequence_ids(i)
+
+            cls_index = tok["input_ids"][i].index(tokenizer.cls_token_id)
+            if not span:
+                start_positions.append(cls_index)
+                end_positions.append(cls_index)
+                continue
+
+            ans_start, ans_end = span
+            token_start = 0
+            while token_start < len(seq_ids) and seq_ids[token_start] != 1:
+                token_start += 1
+            token_end = len(seq_ids) - 1
+            while token_end >= 0 and seq_ids[token_end] != 1:
+                token_end -= 1
+
+            if token_start >= len(seq_ids) or token_end < 0:
+                start_positions.append(cls_index)
+                end_positions.append(cls_index)
+                continue
+
+            if offset[token_start][0] > ans_start or offset[token_end][1] < ans_end:
+                start_positions.append(cls_index)
+                end_positions.append(cls_index)
+                continue
+
+            while token_start <= token_end and offset[token_start][0] <= ans_start:
+                token_start += 1
+            start_positions.append(token_start - 1)
+
+            while token_end >= 0 and offset[token_end][1] >= ans_end:
+                token_end -= 1
+            end_positions.append(token_end + 1)
+
+        tok["start_positions"] = start_positions
+        tok["end_positions"] = end_positions
         return tok
 
-    cols_to_remove = [c for c in dataset.column_names if c not in {"text", "spans"}]
-    out = dataset.map(_map, batched=True, remove_columns=cols_to_remove + ["text", "spans"])
+    out = dataset.map(_map, batched=True, remove_columns=dataset.column_names)
     out.set_format(type="torch")
     return out
 
@@ -198,13 +214,13 @@ def tokenize_and_label(dataset: Dataset, tokenizer, max_length: int = 512) -> Da
 @dataclass
 class TrainConfig:
     model_name: str = "answerdotai/ModernBERT-base"
-    output_dir: str = "modernbert-boundary"
+    output_dir: str = "modernbert-boundary-qa"
     epochs: int = 2
     train_batch_size: int = 8
     eval_batch_size: int = 8
     learning_rate: float = 2e-5
     weight_decay: float = 0.01
-    warmup_ratio: float = 0.05
+    warmup_steps: int = 100
     max_length: int = 512
     max_samples: int = 2000
     eval_ratio: float = 0.1
@@ -219,20 +235,9 @@ def train_boundary_detector(
     no_insert_pct: float = 0.3,
     max_samples: int = 2000,
     model_name: str = "answerdotai/ModernBERT-base",
-    output_dir: str = "modernbert-boundary",
+    output_dir: str = "modernbert-boundary-qa",
 ):
-    """Main function requested by user.
-
-    Args:
-      input_txt_path: path to input.txt (one reference candidate per line)
-      epochs: number of finetuning epochs
-      corruption_percentage: fraction of chars edited in corrupted inserted line
-      corruption_frequency: probability an inserted line gets corrupted
-      no_insert_pct: fraction of C4 paragraphs with no insertion
-      max_samples: synthetic examples to build from C4
-    Returns:
-      tokenizer, model
-    """
+    """Fine-tune a start/end boundary predictor for inserted lines."""
     cfg = TrainConfig(
         model_name=model_name,
         output_dir=output_dir,
@@ -252,15 +257,10 @@ def train_boundary_detector(
     split = ds.train_test_split(test_size=cfg.eval_ratio, seed=cfg.seed)
 
     tokenizer = AutoTokenizer.from_pretrained(cfg.model_name, use_fast=True)
-    train_ds = tokenize_and_label(split["train"], tokenizer, max_length=cfg.max_length)
-    eval_ds = tokenize_and_label(split["test"], tokenizer, max_length=cfg.max_length)
+    train_ds = tokenize_for_qa(split["train"], tokenizer, max_length=cfg.max_length)
+    eval_ds = tokenize_for_qa(split["test"], tokenizer, max_length=cfg.max_length)
 
-    model = AutoModelForTokenClassification.from_pretrained(
-        cfg.model_name,
-        num_labels=len(LABELS),
-        id2label=ID2LABEL,
-        label2id=LABEL2ID,
-    )
+    model = AutoModelForQuestionAnswering.from_pretrained(cfg.model_name)
 
     args = TrainingArguments(
         output_dir=cfg.output_dir,
@@ -269,7 +269,7 @@ def train_boundary_detector(
         per_device_eval_batch_size=cfg.eval_batch_size,
         num_train_epochs=cfg.epochs,
         weight_decay=cfg.weight_decay,
-        warmup_ratio=cfg.warmup_ratio,
+        warmup_steps=cfg.warmup_steps,
         eval_strategy="epoch",
         save_strategy="epoch",
         logging_steps=25,
@@ -283,8 +283,7 @@ def train_boundary_detector(
         args=args,
         train_dataset=train_ds,
         eval_dataset=eval_ds,
-        tokenizer=tokenizer,
-        data_collator=DataCollatorForTokenClassification(tokenizer=tokenizer),
+        data_collator=DefaultDataCollator(),
     )
     trainer.train()
 
@@ -293,48 +292,47 @@ def train_boundary_detector(
     return tokenizer, model
 
 
-def predict_inserted_segments(text: str, tokenizer, model, max_length: int = 512) -> List[str]:
-    """Extract predicted inserted segments from a paragraph."""
+def predict_inserted_segments(
+    text: str,
+    tokenizer,
+    model,
+    question: str = DEFAULT_QUESTION,
+    max_length: int = 512,
+    min_confidence: float = 0.0,
+) -> List[str]:
+    """Predict inserted segment via start/end token scores. Returns [] for no-answer."""
     model.eval()
     enc = tokenizer(
+        question,
         text,
-        return_offsets_mapping=True,
-        truncation=True,
+        truncation="only_second",
         max_length=max_length,
         return_tensors="pt",
     )
-    offsets = enc.pop("offset_mapping")[0].tolist()
     enc = {k: v.to(model.device) for k, v in enc.items()}
 
     with torch.no_grad():
-        logits = model(**enc).logits[0]
-    pred = logits.argmax(dim=-1).cpu().tolist()
+        out = model(**enc)
+        start_logits = out.start_logits[0]
+        end_logits = out.end_logits[0]
 
-    spans = []
-    cur = None
-    for i, label_id in enumerate(pred):
-        label = ID2LABEL.get(label_id, "O")
-        s, e = offsets[i]
-        if s == e:
-            continue
-        if label == "B-INS":
-            if cur is not None:
-                spans.append(cur)
-            cur = [s, e]
-        elif label == "I-INS" and cur is not None:
-            cur[1] = e
-        else:
-            if cur is not None:
-                spans.append(cur)
-                cur = None
-    if cur is not None:
-        spans.append(cur)
+    input_ids = enc["input_ids"][0].detach().cpu().tolist()
+    cls_index = input_ids.index(tokenizer.cls_token_id)
+    best_start = int(torch.argmax(start_logits).item())
+    best_end = int(torch.argmax(end_logits).item())
 
-    return [text[s:e] for s, e in spans if s < e]
+    null_score = float(start_logits[cls_index] + end_logits[cls_index])
+    best_score = float(start_logits[best_start] + end_logits[best_end])
+
+    if best_end < best_start or (best_score - null_score) < min_confidence:
+        return []
+
+    answer_ids = input_ids[best_start : best_end + 1]
+    ans = tokenizer.decode(answer_ids, skip_special_tokens=True).strip()
+    return [ans] if ans else []
 
 
 if __name__ == "__main__":
-    # Minimal local smoke run (expects input.txt present)
     tok, mdl = train_boundary_detector(
         input_txt_path="input.txt",
         epochs=1,
