@@ -943,7 +943,7 @@ def train_boundary_detector(
         learning_rate=3e-5,
         num_train_epochs=3,
         weight_decay=0.01,
-        evaluation_strategy=evaluation_strategy,
+        eval_strategy=evaluation_strategy,
         save_strategy="epoch",
         logging_steps=100,
         report_to="none",
@@ -1847,21 +1847,12 @@ def load_trained_boundary_detector(model_dir: str = "boundary_detector_model"):
 
 if __name__ == "__main__":
 
-    # Supervised JSON example shape:
-    #
-    # [
-    #   {
-    #     "text": "Some passage with references in it.",
-    #     "boundaries": [{"start": 10, "end": 80}, {"start": 120, "end": 180}]
-    #   }
-    # ]
-    #
-    # Training:
-    #
-    # trainer = train_boundary_detector(
-    #     targets_txt_path="targets.txt",
-    #     output_dir="boundary_detector_model",
-    #     supervised_json_path="supervised_examples.json",
-    #     supervised_eval_fraction=0.15,
-    #     supervised_repeat_factor=3,
-    # )
+    trainer = train_boundary_detector(
+        targets_txt_path="citations.txt",
+        output_dir="boundary_detector_model",
+        supervised_json_path="supervised_examples.json",
+        supervised_eval_fraction=0.0,
+        supervised_repeat_factor=3,
+        )
+    model,tokenizer = load_trained_boundary_detector("/content/boundary_detector_model")
+    matches = extract_reference_blocks_large_text(text,model,tokenizer,"cuda")
